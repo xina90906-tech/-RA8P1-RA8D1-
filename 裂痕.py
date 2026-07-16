@@ -23,7 +23,32 @@ import gc
 import tf
 from machine import UART
 
+# --------------------------- 配置参数 ---------------------------
+start_flag = 0
 
+# --------------------------- 功能类定义 ---------------------------
+class PID_step_motor:
+    def __init__(self, kp, ki, target=240):
+        self.e = 0
+        self.e_last = 0
+        self.kp = kp
+        self.ki = ki
+        self.target = target
+    def cal(self, value):
+        self.e = self.target - value
+        delta = self.kp * (self.e-self.e_last) + self.ki * self.e
+        self.e_last = self.e
+        return delta
+
+rx_order1 = [0xA0, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x02, 0xF0, 0xF0]
+def send_order1(number, dir_, steps):
+    global rx_order1, uart
+    rx_order1[2] = number
+    rx_order1[3] = dir_
+    rx_order1[4] = (steps // 256) % 256
+    rx_order1[5] = steps % 256
+    rx_order1[6] = sum(rx_order1[2:6]) % 256
+    uart.write(bytes(rx_order1))
 
 # ============================================================
 # 可调参数
@@ -50,10 +75,19 @@ DEBUG_BLOB = False         # 调试模式：打印每个阶段的 blob 数量
 
 
 # ============================================================
-# 可调参数 —— 人脸检测
+# 人脸检测参数配置
 # ============================================================
-FACE_THRESHOLD = 0.6    # Haar 检测阈值（0.5–0.9），越低越灵敏
-FACE_SCALE = 1.3        # 缩放步长（1.1–1.5），越小越慢但越准
+
+FACE_THRESHOLD = 0.6
+FACE_SCALE = 1.3
+
+# ============================================================
+# 追踪参数配置
+# ============================================================
+
+DEADBAND = 15           #（死区 / 死带）
+RETRACK_THRESHOLD =10  #（重新追踪阈值 / 唤醒阈值）
+CENTERED_DURATION = 2
 
 # ============================================================
 # 可调参数 —— 数字识别
@@ -71,10 +105,10 @@ STATE_CRACK = 2         # 裂痕检测状态
 
 
 # ============================================================
-# 人脸检测
+# 人脸检测初始化
 # ============================================================
+
 def init_face_detection():
-    """加载 Haar Cascade 分类器，失败返回 None。"""
     try:
         cascade = image.HaarCascade("frontalface")
         return cascade
@@ -85,13 +119,16 @@ def init_face_detection():
         except:
             return None
 
+
+# ============================================================
+# 人脸检测函数
+# ============================================================
+
 def detect_face(img, cascade):
-    """检测人脸，返回最大的面部矩形，未检测到返回 None。"""
     try:
         faces = img.find_features(cascade, threshold=FACE_THRESHOLD,
                                   scale_factor=FACE_SCALE)
         if faces:
-            # 返回面积最大的脸
             best = max(faces, key=lambda r: r[2] * r[3])
             return best
     except:
@@ -315,11 +352,19 @@ def main():
     sensor.set_hmirror(True)
     lcd.init()
 
-    # --- 人脸检测初始化 ---
+    pid_x = PID_step_motor(kp=0.5, ki=0.7, target=120)
+    pid_y = PID_step_motor(kp=0.5, ki=0.7, target=120)
+
     face_cascade = init_face_detection()
     if face_cascade is None:
-        print("WARN: Haar cascade not found, skip face detection")
-    print("FACE CASCADE: %s" % ("OK" if face_cascade else "NONE"))
+        print("ERROR: Haar cascade not found!")
+        return
+    print("Face detection initialized")
+
+    last_center_x = -1
+    last_center_y = -1
+    TARGET_CENTERED = False
+    centered_start_time = 0
 
 
     # --- UART2 串口初始化（PID步进电机控制）---
@@ -348,28 +393,68 @@ def main():
         # 状态0：人脸检测
         # ========================================================
         if state == STATE_FACE:
-            if face_cascade:
-                face_rect = detect_face(img, face_cascade)
+            face_rect = detect_face(img, face_cascade)
 
             if face_rect:
-                # 检测到人脸 → 框出人脸 → 进入数字识别等待状态
-                img.draw_rectangle(face_rect, color=(0, 255, 0), thickness=2)
-                img.draw_string(10, 10, "Face OK!", color=(0, 255, 0))
+                x, y, w, h = face_rect
+                center_x = x + w // 2
+                center_y = y + h // 2
 
-                state = STATE_DIGIT
-                digit_wait_start = time.ticks_ms()
-                print("FACE DETECTED -> WAIT 5s FOR DIGIT RECOGNITION")
-                # 本帧先显示人脸框，下一帧开始计时
-                lcd.display(img.copy())
-                frame += 1
-                continue
+                print("Face center: (%d, %d)" % (center_x, center_y))
+
+                img.draw_rectangle(face_rect, color=(0, 255, 0), thickness=2)
+                img.draw_cross(center_x, center_y, color=(0, 255, 0), size=5)
+                img.draw_string(10, 10, "(%d,%d)" % (center_x, center_y), color=(0, 255, 0))
+
+                delta_from_center_x = abs(center_x - pid_x.target)
+                delta_from_center_y = abs(center_y - pid_y.target)
+
+                delta_from_last_x = abs(center_x - last_center_x) if last_center_x != -1 else 0
+                delta_from_last_y = abs(center_y - last_center_y) if last_center_y != -1 else 0
+
+                last_center_x = center_x
+                last_center_y = center_y
+
+                if delta_from_center_x > DEADBAND or delta_from_center_y > DEADBAND:
+                    print("追踪目标，偏差: X=%d, Y=%d" % (delta_from_center_x, delta_from_center_y))
+                    start_flag = 1
+                    TARGET_CENTERED = False
+                    centered_start_time = 0
+                elif not TARGET_CENTERED:
+                    print("目标已居中，开始计时")
+                    TARGET_CENTERED = True
+                    start_flag = 0
+                    centered_start_time = time.time()
+                elif delta_from_last_x > RETRACK_THRESHOLD or delta_from_last_y > RETRACK_THRESHOLD:
+                    print("目标移动过大，重新追踪: X=%d, Y=%d" % (delta_from_last_x, delta_from_last_y))
+                    start_flag = 1
+                    TARGET_CENTERED = False
+                    centered_start_time = 0
+                elif TARGET_CENTERED and centered_start_time > 0:
+                    elapsed_time = time.time() - centered_start_time
+                    if elapsed_time >= CENTERED_DURATION:
+                        print("目标居中达到 %d 秒，退出人脸追踪" % CENTERED_DURATION)
+                        state = STATE_DIGIT
+                        start_flag = 0
+                        img.draw_string(10, 50, "Waiting 0xFF", color=(0, 0, 255), scale=2)
+
+                if start_flag == 1:
+                    delta_x = pid_x.cal(center_x)
+                    dir_x = 0 if delta_x > 0 else 1
+                    send_order1(0, dir_x, abs(int(delta_x)))
+
+                    delta_y = pid_y.cal(center_y)
+                    dir_y = 0 if delta_y < 0 else 1
+                    send_order1(1, dir_y, abs(int(delta_y)))
+
             else:
-                # 未检测到人脸 → 继续等待
-                img.draw_string(10, 10, "No Face Detected", color=(255, 0, 0), scale=2)
-                img.draw_string(10, 40, "Look at camera...", color=(255, 0, 0), scale=2)
-                lcd.display(img.copy())
-                frame += 1
-                continue
+                img.draw_string(10, 10, "No Face", color=(255, 0, 0), scale=2)
+                print("No face detected")
+                start_flag = 0
+                TARGET_CENTERED = False
+                centered_start_time = 0
+                last_center_x = -1
+                last_center_y = -1
 
         # ========================================================
         # 状态1：等待5秒 + 数字识别保持2秒后锁定
@@ -465,15 +550,20 @@ def main():
                     img.draw_rectangle(b.rect(), color=255, thickness=1)
                     img.draw_cross(b.cx(), b.cy(), color=255, size=3)
 
-                # 仅在检测到裂痕的第一帧发送
+                # 仅在检测到裂痕的第一帧，并且收到串口发来的 0x0F 后发送
                 if not crack_sent:
-                    send_order(int(locked_digit), 1)
-                    crack_sent = True
+
+                    rx_data = uart.read()         # 读取所有串口缓存数据【
+                    if 0xFF in rx_data:           # 识别到发过来的 0xFF 字节+
+                        send_order(int(locked_digit), 1)
+                        print("hdfdhkkjfkhdkslkjfksljflkfj")
+                        crack_sent = True
 
                 # 帧率统计（每10帧打印一次）
                 if frame % 10 == 0:
                     print("FPS: %.1f  digit=%s  cracks=%d" % (
                         clock.fps(), locked_digit, len(blobs)))
+
             else:
                 # 未检测到裂纹
                 if frame % 10 == 0:
